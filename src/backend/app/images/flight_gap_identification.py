@@ -22,6 +22,7 @@ from psycopg import Connection
 from psycopg.rows import dict_row
 
 from app.models.enums import ImageStatus
+from app.images.image_footprints import image_footprint_polygon
 from app.s3 import maybe_presign_s3_key
 
 from app.utils import (
@@ -220,24 +221,29 @@ def _detect_sparse_coverage_gap(
     specs = DRONE_PARAMS[drone_type]
     forward_footprint = average_altitude * specs["VERTICAL_FOV"]
     horizontal_footprint = average_altitude * specs["HORIZONTAL_FOV"]
-    coverage_radius = min(forward_footprint, horizontal_footprint) / 2
-
-    if coverage_radius <= 0:
-        return None
-
     task_aoi_m = _project_geometry_to_meters(task_aoi)
-    coverage_buffers = []
+    image_footprints = []
 
     for image in images:
-        point_m = point_to_meters(image["image_location_json"])
-        if point_m is None:
+        footprint = image_footprint_polygon(
+            {
+                "id": image.get("id"),
+                "location": image.get("image_location_json"),
+                "altitude_m": average_altitude,
+                "yaw_deg": image.get("yaw_deg"),
+            }
+        )
+        if footprint is None:
             continue
-        coverage_buffers.append(point_m.buffer(coverage_radius))
+        image_footprints.append(footprint)
 
-    if not coverage_buffers:
+    if not image_footprints:
         return None
 
-    covered_area_m = unary_union(coverage_buffers)
+    covered_area_m = unary_union(image_footprints)
+    if covered_area_m.intersection(task_aoi_m).is_empty:
+        return None
+
     uncovered_area_m = task_aoi_m.difference(covered_area_m)
     image_footprint_area = forward_footprint * horizontal_footprint
     min_gap_area = max(image_footprint_area * 0.5, 100.0)
@@ -478,7 +484,7 @@ async def identify_flight_gaps(
                     i.uploaded_at
                 ) AS sort_ts,
                 NULLIF(i.exif->>'FlightYawDegree', '')::double precision AS yaw_deg,
-                NULLIF(regexp_replace(COALESCE(i.exif->>'AbsoluteAltitude',''), '[^0-9+\\-.]+', '', 'g'), '')::double precision AS altitude_m
+                NULLIF(regexp_replace(COALESCE(i.exif->>'RelativeAltitude',''), '[^0-9+\\-.]+', '', 'g'), '')::double precision AS altitude_m
             FROM project_images i
             INNER JOIN tasks t ON i.task_id = t.id
             LEFT JOIN drone_flights df ON t.id = df.task_id
@@ -1061,6 +1067,49 @@ async def identify_flight_gaps(
             "kmz_bytes": None,
             "images": images_geojson,
         }
+
+    # If trajectory spacing did not find a gap, fall back to footprint coverage.
+    # This catches cases where images are close together but cover only a small strip.
+    if not manual_gaps and not gap_type and flight_drone_type and project_image_results:
+        sparse_gap_geometry = _detect_sparse_coverage_gap(
+            task_aoi_outline,
+            project_image_results,
+            flight_drone_type,
+            overall_average_altitude,
+        )
+
+        if sparse_gap_geometry is not None:
+            sparse_yaws = [
+                row["yaw_deg"]
+                for row in project_image_results
+                if row.get("yaw_deg") is not None
+            ]
+            sparse_rotation = circular_mean_list(sparse_yaws) if sparse_yaws else None
+
+            result = _generate_flightplan_for_geometry(
+                sparse_gap_geometry,
+                drone_type=flight_drone_type,
+                average_altitude=overall_average_altitude,
+                rotation_angle=sparse_rotation,
+            )
+
+            return {
+                "message": "Successfully identified footprint coverage gaps."
+                if result
+                else "Gaps identified, but no flightplan was generated.",
+                "task_id": str(task_id),
+                "task_geometry": _geometry_to_feature(task_aoi_outline),
+                "gap_polygons": _geometry_to_feature_collection(
+                    result["geometry"] if result else sparse_gap_geometry
+                ),
+                "gap_type": "sparse",
+                "drone_type": flight_drone_type,
+                "altitude": overall_average_altitude,
+                "rotation": sparse_rotation,
+                "overlap": global_side_overlap_median,
+                "kmz_bytes": result["kmz_bytes"] if result else None,
+                "images": images_geojson,
+            }
 
     if not flight_drone_type:
         message = "Missing drone metadata"
