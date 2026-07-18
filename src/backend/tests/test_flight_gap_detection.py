@@ -2,10 +2,17 @@ import io
 import zipfile
 
 import pytest
+from shapely.geometry import MultiPolygon, box, mapping
+from shapely.ops import transform
 
 from drone_flightplan.drone_type import DroneType
 
-from app.images.flight_gap_identification import identify_flight_gaps
+from app.images.flight_gap_identification import (
+    _detect_sparse_coverage_gap,
+    _generate_flightplan_for_geometry,
+    identify_flight_gaps,
+)
+from app.images.image_footprints import inverse_projector
 
 
 def assert_is_valid_flightplan(buffer: bytes):
@@ -20,6 +27,84 @@ def assert_is_valid_flightplan(buffer: bytes):
         assert any(
             any(extension in f for extension in valid_extensions) for f in filenames
         ), f"No valid flight plan files found in KMZ. Files: {filenames}"
+
+
+def _point_from_meters(x: float, y: float) -> dict:
+    # Build test image GPS points from meter coordinates so the geometry is easy.
+    lon, lat = inverse_projector.transform(x, y)
+    return {"type": "Point", "coordinates": [lon, lat]}
+
+
+def _aoi_from_meters(min_x: float, min_y: float, max_x: float, max_y: float):
+    # The real code receives lon/lat geometry, so convert this simple meter box back.
+    return transform(
+        inverse_projector.transform,
+        box(min_x, min_y, max_x, max_y),
+    )
+
+
+def test_sparse_coverage_gap_generates_single_gap_flightplan():
+    # Images cover only the left side of the task, leaving one clear missing area.
+    task_aoi = _aoi_from_meters(-150, -100, 150, 100)
+    images = [
+        {
+            "id": f"left-{idx}",
+            "image_location_json": _point_from_meters(-120, y),
+            "yaw_deg": 90,
+        }
+        for idx, y in enumerate([-75, -55, -35, -15, 5, 25, 45, 65])
+    ]
+
+    gap = _detect_sparse_coverage_gap(
+        task_aoi,
+        images,
+        DroneType.DJI_MINI_4_PRO,
+        average_altitude=60,
+    )
+    result = _generate_flightplan_for_geometry(
+        gap,
+        DroneType.DJI_MINI_4_PRO,
+        average_altitude=60,
+        rotation_angle=90,
+    )
+
+    assert gap is not None
+    assert gap.geom_type == "Polygon"
+    assert result is not None
+    assert result["geometry"].geom_type == "Polygon"
+    assert_is_valid_flightplan(result["kmz_bytes"])
+
+
+def test_sparse_coverage_gap_generates_two_gap_flightplan():
+    # A flown strip through the middle splits the missing area into top and bottom gaps.
+    task_aoi = _aoi_from_meters(-150, -150, 150, 150)
+    images = [
+        {
+            "id": f"middle-{idx}",
+            "image_location_json": _point_from_meters(x, 0),
+            "yaw_deg": 90,
+        }
+        for idx, x in enumerate([-125, -105, -85, -65, -45, -25, -5, 15, 35, 55, 75, 95, 115])
+    ]
+
+    gap = _detect_sparse_coverage_gap(
+        task_aoi,
+        images,
+        DroneType.DJI_MINI_4_PRO,
+        average_altitude=60,
+    )
+    result = _generate_flightplan_for_geometry(
+        gap,
+        DroneType.DJI_MINI_4_PRO,
+        average_altitude=60,
+        rotation_angle=90,
+    )
+
+    assert isinstance(gap, MultiPolygon)
+    assert len(gap.geoms) == 2
+    assert result is not None
+    assert isinstance(result["geometry"], MultiPolygon)
+    assert_is_valid_flightplan(result["kmz_bytes"])
 
 
 @pytest.mark.asyncio
